@@ -1,0 +1,384 @@
+// ==UserScript==
+// @name         Screenshot + Excel Downloader with Sessions (5min) + Auto-Trigger
+// @namespace    http://tampermonkey.net/
+// @version      3.3
+// @description  Take screenshots and download daily Excel (CSV) with conversation/message IDs and session tracking
+// @match        https://gamma.console.harmony.a2z.com/bc-rag-simulator/v6_4_3
+// @require      https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js
+// @grant        GM_download
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    const STORE_KEY = '__tm_screenshot_rows';
+    const USER_KEY = '__tm_username';
+    const DATE_KEY = '__tm_current_date';
+
+    // The specific message to watch for
+    const TARGET_MESSAGE = "An error occurred while sending the message. Please try again.";
+
+    // Session-based tracking (resets on page refresh)
+    let processedThisSession = new Set();
+
+    /* ---------- helpers ---------- */
+
+    function getTodayKey() {
+        const d = new Date();
+        return (
+            d.getFullYear() + '-' +
+            String(d.getMonth() + 1).padStart(2, '0') + '-' +
+            String(d.getDate()).padStart(2, '0')
+        );
+    }
+
+    function getNowParts() {
+        const d = new Date();
+        const date =
+            String(d.getMonth() + 1).padStart(2, '0') + '/' +
+            String(d.getDate()).padStart(2, '0') + '/' +
+            d.getFullYear();
+
+        const time =
+            String(d.getHours()).padStart(2, '0') + ':' +
+            String(d.getMinutes()).padStart(2, '0') + ':' +
+            String(d.getSeconds()).padStart(2, '0');
+
+        return { date, time };
+    }
+
+    function sanitize(text) {
+        return text.replace(/[^a-z0-9._-]/gi, '_');
+    }
+
+    /* ---------- Extract Conversation ID and Message ID ---------- */
+
+    function extractConversationId() {
+        // Try multiple methods to find conversation ID
+
+        // Method 1: From URL
+        const urlMatch = window.location.href.match(/conversation[_-]?id[=:]([a-zA-Z0-9-]+)/i);
+        if (urlMatch) return urlMatch[1];
+
+        // Method 2: From data attributes
+        const convElement = document.querySelector('[data-conversation-id], [data-conv-id]');
+        if (convElement) {
+            return convElement.getAttribute('data-conversation-id') ||
+                   convElement.getAttribute('data-conv-id');
+        }
+
+        // Method 3: From page content
+        const elements = document.querySelectorAll('div, span, input, meta');
+        for (const el of elements) {
+            const text = el.textContent || el.getAttribute('content') || el.value || '';
+            const match = text.match(/conversation[_\s-]?id[:\s]*([a-zA-Z0-9-]{8,})/i);
+            if (match) return match[1];
+        }
+
+        return 'N/A';
+    }
+
+    function extractMessageId(messageElement) {
+        if (!messageElement) return 'N/A';
+
+        // Method 1: Direct data attribute
+        const msgId = messageElement.getAttribute('data-message-id') ||
+                     messageElement.getAttribute('data-msg-id') ||
+                     messageElement.closest('[data-message-id]')?.getAttribute('data-message-id');
+        if (msgId) return msgId;
+
+        // Method 2: Look for ID in nearby elements
+        const parent = messageElement.closest('[id], [data-id]');
+        if (parent) {
+            return parent.id || parent.getAttribute('data-id') || 'N/A';
+        }
+
+        return 'N/A';
+    }
+
+    /* ---------- daily reset ---------- */
+
+    function ensureTodayData() {
+        const today = getTodayKey();
+        const savedDate = localStorage.getItem(DATE_KEY);
+        if (savedDate !== today) {
+            localStorage.setItem(DATE_KEY, today);
+            localStorage.setItem(STORE_KEY, JSON.stringify([]));
+        }
+    }
+
+    function getRows() {
+        ensureTodayData();
+        return JSON.parse(localStorage.getItem(STORE_KEY) || '[]');
+    }
+
+    function saveRows(rows) {
+        ensureTodayData();
+        localStorage.setItem(STORE_KEY, JSON.stringify(rows));
+    }
+
+    /* ---------- STRICT & CLEAN username scraper ---------- */
+
+    function scrapeUsername() {
+        const elements = document.querySelectorAll('label, span, div, p');
+        for (const el of elements) {
+            const text = el.textContent || '';
+            if (/Username\s*:/i.test(text)) {
+                const match = text.match(/Username\s*:\s*([a-zA-Z0-9._-]+)(?:\s|$)/i);
+                if (match && match[1]) {
+                    let username = match[1].trim();
+                    username = username.replace(/(intent|status|role|type|mode)$/i, '')
+                        .split(/[^a-zA-Z0-9._-]/)[0];
+                    return username;
+                }
+            }
+        }
+        return null;
+    }
+
+    /* ---------- username resolution ---------- */
+
+    function getUsername() {
+        const scrapedUser = scrapeUsername();
+        if (scrapedUser) {
+            localStorage.setItem(USER_KEY, scrapedUser);
+            console.log('Username auto-scraped:', scrapedUser);
+            return scrapedUser;
+        }
+        const storedUser = localStorage.getItem(USER_KEY);
+        if (storedUser) return storedUser;
+        return 'user';
+    }
+
+    setTimeout(() => {
+        getUsername();
+        ensureTodayData();
+    }, 1000);
+
+    /* ---------- screenshot ---------- */
+
+    async function takeScreenshot(isAutomatic = false, messageElement = null) {
+        panel.style.display = 'none';
+        try {
+            const canvas = await html2canvas(document.documentElement, {
+                scale: Math.min(window.devicePixelRatio, 2),
+                useCORS: true
+            });
+            canvas.toBlob(blob => {
+                const { date, time } = getNowParts();
+                const username = getUsername();
+                const safeUser = sanitize(username);
+                const filename = `${safeUser}_${date.replace(/\//g, '-')}_${time.replace(/:/g, '-')}.png`;
+
+
+                GM_download({
+                    url: URL.createObjectURL(blob),
+                    name: filename,
+                    saveAs: false
+                });
+
+                const rows = getRows();
+                // Store: Username, Date, Time, Conversation ID, Message ID, Filename, URL
+                rows.push([username, date, time, filename, location.href]);
+                saveRows(rows);
+
+                if (isAutomatic) {
+                    console.log('Auto-screenshot captured');
+                }
+            });
+        } catch (e) {
+            console.error(e);
+            if (!isAutomatic) {
+                alert('Screenshot failed: ' + e.message);
+            }
+        } finally {
+            panel.style.display = 'flex';
+        }
+    }
+
+    /* ---------- auto-screenshot on specific message ---------- */
+
+    function checkForTargetMessage() {
+        const botMessages = document.querySelectorAll('.bot-message, .assistant-message, [data-role="assistant"], .message-content, [class*="message"], [class*="bot"], [class*="assistant"]');
+
+        botMessages.forEach(message => {
+            const messageText = message.textContent.trim();
+
+            if (messageText.includes(TARGET_MESSAGE)) {
+                const messageId = message.getAttribute('data-message-id') ||
+                                message.closest('[data-message-id]')?.getAttribute('data-message-id') ||
+                                'target_message';
+
+                if (!processedThisSession.has(messageId)) {
+                    processedThisSession.add(messageId);
+
+                    setTimeout(() => {
+                        takeScreenshot(true, message);
+                    }, 500);
+                }
+            }
+        });
+    }
+
+    /* ---------- observer for new messages ---------- */
+
+    const observer = new MutationObserver((mutations) => {
+        mutations.forEach((mutation) => {
+            if (mutation.addedNodes.length > 0) {
+                setTimeout(checkForTargetMessage, 800);
+            }
+        });
+    });
+
+    window.addEventListener('load', () => {
+        const chatContainer = document.querySelector('.chat-container, .messages-container, #chat-messages, .conversation-container, [class*="chat"], [class*="conversation"]');
+
+        if (chatContainer) {
+            observer.observe(chatContainer, {
+                childList: true,
+                subtree: true
+            });
+
+            setTimeout(checkForTargetMessage, 1500);
+            console.log('Auto-screenshot observer initialized');
+        } else {
+            console.warn('Chat container not found. Auto-screenshot may not work.');
+        }
+    });
+
+    setInterval(checkForTargetMessage, 3000);
+
+    /* ---------- excel (csv) with sessions >5min ---------- */
+
+
+function downloadExcel() {
+    const rows = getRows();
+    if (!rows.length) {
+        alert('No screenshots taken today');
+        return;
+    }
+
+    const username = getUsername();
+    const safeUser = sanitize(username);
+    const today = getTodayKey();
+
+    // Sort rows by date & time
+    const sortedRows = rows.slice().sort((a, b) => {
+        const t1 = new Date(a[1] + ' ' + a[2]);
+        const t2 = new Date(b[1] + ' ' + b[2]);
+        return t1 - t2;
+    });
+
+    const sessions = [];
+    let session = { start: null, end: null, screenshots: [] };
+
+    sortedRows.forEach(row => {
+        const dt = new Date(row[1] + ' ' + row[2]);
+        if (!session.start) {
+            session.start = dt;
+            session.end = dt;
+            session.screenshots.push(row);
+        } else {
+            const diff = (dt - session.end) / 1000;
+            if (diff <= 300) {
+                session.end = dt;
+                session.screenshots.push(row);
+            } else {
+                sessions.push(session);
+                session = { start: dt, end: dt, screenshots: [row] };
+            }
+        }
+    });
+
+    if (session.start) sessions.push(session);
+
+    // Build CSV
+    const csvRows = [];
+    // Add summary row ONCE at the top
+    csvRows.push([`Total Sessions: ${sessions.length}`]);
+    csvRows.push([]);
+    csvRows.push(['Session', 'Start Time', 'End Time', 'Duration (HH:MM:SS)', 'Username', 'Date', 'Time', 'Filename', 'URL']);
+
+    sessions.forEach((s, i) => {
+        const durationSec = Math.round((s.end - s.start) / 1000);
+        const h = String(Math.floor(durationSec / 3600)).padStart(2, '0');
+        const m = String(Math.floor((durationSec % 3600) / 60)).padStart(2, '0');
+        const sSec = String(durationSec % 60).padStart(2, '0');
+        const durationStr = `${h}:${m}:${sSec}`;
+
+        s.screenshots.forEach((row, idx) => {
+            // Only include session info on the first row of each session
+            if (idx === 0) {
+                csvRows.push([
+                    i + 1,
+                    s.start.toLocaleTimeString(),
+                    s.end.toLocaleTimeString(),
+                    durationStr,
+                    ...row
+                ]);
+            } else {
+                // Leave session columns empty for subsequent rows in the same session
+                csvRows.push([
+                    '',
+                    '',
+                    '',
+                    '',
+                    ...row
+                ]);
+            }
+        });
+    });
+
+    const csvContent = csvRows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+
+    const blob = new Blob([csvContent], { type: 'text/csv' });
+
+    GM_download({
+        url: URL.createObjectURL(blob),
+        name: `${safeUser}_screenshots_${today}.csv`,
+        saveAs: true
+    });
+}
+
+
+    /* ---------- UI panel ---------- */
+
+    const panel = document.createElement('div');
+    panel.style.cssText = `
+        position: fixed;
+        bottom: 40px;
+        right: 40px;
+        display: flex;
+        gap: 8px;
+        padding: 8px;
+        background: #111;
+        border-radius: 10px;
+        z-index: 999999;
+        box-shadow: 0 4px 12px rgba(0,0,0,.35);
+    `;
+
+    function makeBtn(text, title, bg) {
+        const b = document.createElement('button');
+        b.textContent = text;
+        b.title = title;
+        Object.assign(b.style, {
+            padding: '8px 12px',
+            fontSize: '14px',
+            borderRadius: '8px',
+            border: 'none',
+            cursor: 'pointer',
+            background: bg,
+            color: '#fff'
+        });
+        return b;
+    }
+
+    const excelBtn = makeBtn('Downtime Report', 'Download Today\'s Excel', '#2da44e');
+
+
+    excelBtn.onclick = downloadExcel;
+
+    panel.appendChild(excelBtn);
+    document.body.appendChild(panel);
+
+})();
